@@ -1,0 +1,332 @@
+#include "mbed.h"
+#include "C12832.h"
+#include "QEI.h"
+
+//set const
+const float PI = 3.14159265358979323846;
+const float MIN_VELOCITY = 25.0; // Set the minimum desired velocity in meters per second
+const float MAX_VELOCITY = 33.0; // Set the maximum desired velocity in meters per second
+const float WHEEL_DISTANCE = 0.15; // Distance between the wheels
+const int PWM_PERIOD = 500;
+
+//Serial pc(USBTX, USBRX);
+
+bool state1, state2, state3, state4, state5, state6;
+float desired_velocity; // Set the desired velocity in meters per second
+bool terminal_detected = false;
+bool ble_start_flag = false;
+
+// PID Class for PID control
+class PID {
+    private:
+        float kp, ki, kd, error, prevError, integral, derivative;
+        float integral_limit;
+
+    public:
+        PID(float kp, float ki, float kd, float integral_limit) : kp(kp), ki(ki), kd(kd), error(0), prevError(0), integral(0), derivative(0), integral_limit(integral_limit) {}
+
+        float update(float setpoint, float measured_value) {
+            error = setpoint - measured_value;
+            integral += error;
+
+            // Limit the integral term
+            if (integral > integral_limit) {
+                integral = integral_limit;
+            } else if (integral < -integral_limit) {
+                integral = -integral_limit;
+            }
+
+            derivative = error - prevError;
+            prevError = error;
+            return kp * error + ki * integral + kd * derivative;
+        }
+};
+
+//PID Control Parameters Define
+PID pid_velocity(0.033, 0.0, 0.01, 9.0), pid_line(0.12, 0.0025, 0.10, 9.0);
+
+class Joystick {     //Begin Joystick class definition
+
+    private:    //Private data member declaration
+        DigitalIn fire;      //Declaration of DigitalIn objects
+
+    public:     //Public declarations
+        Joystick(PinName f) : fire(f){};     //Constructor - user provided pin names are assigned to the DigitalIn
+
+    bool firePressed(void){     //Public member function for testing Joystick Fire on
+        return fire;    //Return the Joystick Fire active state
+    }
+};
+
+class motor{
+    private:
+        PwmOut outputsignal;
+        DigitalOut bipolar;
+        DigitalOut direction;
+        bool status;
+
+    public:
+        motor(PinName p1, PinName p2, PinName p3): outputsignal(p1), bipolar(p2), direction(p3){};
+
+        void send(float dutycycle, float pwm_period){
+            outputsignal.period_us(pwm_period);
+            outputsignal.write(1.0 - dutycycle);
+        }
+
+        void bipolar_on(){
+            bipolar = 1;
+        }
+
+        void bipolar_off(){
+            bipolar = 0;
+        }
+
+        void direction_set(){
+            direction = 1;
+            status = true;
+        }
+
+        void direction_clear(){
+            direction = 0;
+            status = false;
+        }
+
+        void direction_toggle(){
+            if (status)
+                direction_clear(); 
+            else
+                direction_set();
+        }
+};
+
+class encoder : public QEI {
+    private:
+        Timer mytimer;
+        float wheelDiameter, gearRatio, CPR, velocity, tickRate;
+
+    public:
+        encoder(PinName channelA, PinName channelB, PinName index, int pulsesPerRev, Encoding encoding) : QEI(channelA, channelB, index, pulsesPerRev, encoding){mytimer.start(); wheelDiameter = 0.08213; CPR = 1024; gearRatio = 13.6; QEI::reset();};
+
+        float getVelocity() {
+            float elapsedTime = mytimer.read();
+            float ticks = QEI::getPulses();
+            mytimer.reset();
+            QEI::reset();
+
+            float revolutions = ticks / CPR;
+            float wheelCircumference = PI * wheelDiameter;
+            float distance = wheelCircumference * revolutions * gearRatio;
+            float velocity = distance / elapsedTime;
+
+        return velocity;
+        }
+};
+
+class LED{
+
+    private:
+        DigitalOut signal;
+        bool status;
+
+    public:
+        LED(PinName pin):signal(pin){}
+
+        void on(void){
+            signal = 1;                           
+            status = true;                              
+        }
+
+        void off(void){
+            signal = 0;                           
+            status = false;                             
+        }
+
+        void toggle(void){
+            if (status)                                
+                off();                                  
+            else                                        
+                on();                                   
+        }
+};
+
+//LCD Define
+C12832 lcd(D11, D13, D12, D7, D10);
+
+// Motor Drive Board Define
+motor Lmotor(PC_8,PC_9,PB_8), Rmotor(PC_6,PB_2,PB_12);
+encoder Lwheel (PC_10, PC_12, NC, 1024, QEI::X4_ENCODING), Rwheel(PB_14, PB_13, NC, 1024, QEI::X4_ENCODING);
+DigitalOut enable(PC_11);
+
+//Line Sensors Define
+AnalogIn sensor1(PC_2), sensor2(PC_3), sensor3(PC_0), sensor4(PC_5), sensor5(PB_1), sensor6(PC_4);
+LED emitter1(PA_13), emitter2(PA_14), emitter3(PB_7), emitter4(PC_13), emitter5(PC_14), emitter6(PC_15);
+
+//Tickers Define
+Ticker myticker1;
+Ticker control_loop_ticker;
+
+//BLE declarations
+Serial hm10(PA_11, PA_12); //UART6 TX,RX
+DigitalOut ledR(D5), ledG(D9), ledB(D8);
+int c;
+
+float get_transvelocity() {
+    float transvelocity = (Lwheel.getVelocity() + Rwheel.getVelocity()) / 2.0;
+    return transvelocity;
+}
+
+float get_angvelocity(){
+    float angvelocity = (Rwheel.getVelocity()-Lwheel.getVelocity())/WHEEL_DISTANCE;
+    return angvelocity;
+}
+
+void display_Trans_velocity(){
+    lcd.cls();
+    lcd.locate(0,0);
+    lcd.printf("Translational velocity: %.2f m/s", get_transvelocity());
+
+    lcd.locate(0,10);
+    lcd.printf("S1: %.2f S2: %.2f", sensor1.read(), sensor2.read());
+
+    lcd.locate(0,20);
+    lcd.printf("S5: %.2f S6: %.2f", sensor3.read(), sensor4.read());
+}
+
+void display_Angu_velocity(){
+    lcd.cls();
+    lcd.locate(0,10);
+    lcd.printf("Angular velocity: %.2f rad/s", get_angvelocity());
+}
+
+void display_velocities() {
+    display_Trans_velocity();
+}
+
+void update_desired_velocity() {
+    //Calculate the curvature based on the line sensor values
+    float curvature = fabs(sensor3.read() - sensor4.read()) + fabs(sensor5.read() - sensor6.read());
+    //Update the desired velocity based on the curvature
+    desired_velocity = MAX_VELOCITY - (MAX_VELOCITY - MIN_VELOCITY) * curvature;
+}
+
+float line_threshold = 0.4;
+
+void update_control() {
+    state1 = (sensor1.read() < line_threshold) ? true : false;  
+    state2 = (sensor2.read() < line_threshold) ? true : false;
+    state3 = (sensor3.read() < line_threshold) ? true : false;
+    state4 = (sensor4.read() < line_threshold) ? true : false;
+    state5 = (sensor5.read() < line_threshold) ? true : false;
+    state6 = (sensor6.read() < line_threshold) ? true : false;
+
+    float line_error = 0.0;
+    line_error = (sensor2.read() - sensor1.read())*2.0;
+    const float weights[] = {2.0, -2.0, 4.0, -4.0};
+    float sensor_values[] = {state3, state4, state5, state6};
+
+    bool line_detected = false;
+    for (int i = 0; i < sizeof(weights) / sizeof(weights[0]); i++) {
+        line_error += weights[i] * sensor_values[i];
+    }
+
+    if ((state1 == 0) && (state2 == 0) && (state3 == 0) && (state4 == 0) && (state5 == 0) && (state6 == 0)) {
+        Lmotor.direction_clear();
+        Rmotor.direction_clear();
+        Lmotor.send(0.9, PWM_PERIOD);
+        Rmotor.send(0.9, PWM_PERIOD);
+        wait(0.1);
+        enable = 0;
+        Lmotor.send(1.0, PWM_PERIOD);
+        Rmotor.send(1.0, PWM_PERIOD);
+    } else {
+    // PID control
+    float velocity_correction = pid_velocity.update(desired_velocity, get_transvelocity());
+    float angular_correction = pid_line.update(0.0, line_error);
+
+    // Motor control update
+    float Lmotor_correction = velocity_correction - angular_correction;
+    float Rmotor_correction = velocity_correction + angular_correction;
+
+    Lmotor.send(fabs(Lmotor_correction), PWM_PERIOD);
+    Rmotor.send(fabs(Rmotor_correction), PWM_PERIOD);
+    }
+}
+
+void control_loop() {
+    update_desired_velocity();
+    update_control();
+}
+
+void turn_around() {
+    control_loop_ticker.detach();
+    Lmotor.direction_clear();
+    Rmotor.direction_set();
+    Lmotor.send(0.6, PWM_PERIOD);
+    Rmotor.send(0.55, PWM_PERIOD);
+    wait(0.7);
+    Lmotor.direction_set();
+    Rmotor.direction_set();
+    enable = 0;
+    wait(0.5);
+    enable = 1;
+    control_loop_ticker.attach(&control_loop, 0.01);
+    ledR = 1;
+}
+
+int main() {
+    hm10.baud(9600);
+    //myticker1.attach(&display_velocities, 0.5);
+    bool turn_around_flag = false;
+    ledR = 1;
+    ledG = 1;
+    ledB = 1;
+    Joystick Joystick (D4);
+
+    Lmotor.bipolar_off();
+    Rmotor.bipolar_off();
+    Lmotor.direction_set();
+    Rmotor.direction_set();
+
+    emitter1.on();
+    emitter2.on();
+    emitter3.on();
+    emitter4.on();
+    emitter5.on();
+    emitter6.on();
+
+    bool control_loop_active = false;
+    bool fire_button_prev = false;
+
+    while (1) {
+        if (hm10.readable()) {
+            c = hm10.getc();
+            if (c == 5) {
+                ledR = 0;
+                turn_around_flag = true;
+                ble_start_flag = true;
+            }
+        }
+
+        if (turn_around_flag) {
+            turn_around();
+            turn_around_flag = false;
+            control_loop_active = true;
+        }
+
+        bool fire_button_current = Joystick.firePressed();
+
+        if (fire_button_current && !fire_button_prev) {
+            control_loop_active = !control_loop_active;
+
+            if (control_loop_active) {
+                enable = 1;
+                control_loop_ticker.attach(&control_loop, 0.01);
+            } else {
+                enable = 0;
+                control_loop_ticker.detach();
+            }
+        }
+
+        fire_button_prev = fire_button_current;
+    }
+}
